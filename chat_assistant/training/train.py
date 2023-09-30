@@ -178,7 +178,16 @@ def main(args):
     model.config.use_cache = False
 
     # datasets
-    train_dataset, eval_dataset = create_datasets(tokenizer, args)
+    raw_datasets = get_raw_dataset(args, args)
+    tokenized_datasets, lm_datasets = process_datasets(
+        training_args=training_args,
+        data_args=args,
+        raw_datasets=raw_datasets,
+        tokenizer=tokenizer,
+    )
+    train_dataset = lm_datasets["train"]
+    eval_dataset = lm_datasets["validation"]
+    
 
     # trainer
     trainer = Trainer(model=model, args=training_arguments, train_dataset=train_dataset, eval_dataset=eval_dataset)
