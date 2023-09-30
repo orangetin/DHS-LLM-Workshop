@@ -13,126 +13,126 @@ from einops import rearrange
 from flash_attn import flash_attn_func
 
 
-def forward(
-    self,
-    hidden_states: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_value: Optional[Tuple[torch.Tensor]] = None,
-    output_attentions: bool = False,
-    use_cache: bool = False,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-    bsz, q_len, _ = hidden_states.size()
-
-    if self.config.pretraining_tp > 1:
-        raise ValueError("pretraining_tp > 1 is not supported for flash attention")
-    else:
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-
-    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-    key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-    value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-    kv_seq_len = key_states.shape[-2]
-
-    if past_key_value is not None:
-        kv_seq_len += past_key_value[0].shape[-2]
-    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-
-    if past_key_value is not None:
-        # reuse k, v, self_attention
-        key_states = torch.cat([past_key_value[0], key_states], dim=2)
-        value_states = torch.cat([past_key_value[1], value_states], dim=2)
-
-    past_key_value = (key_states, value_states) if use_cache else None
-
-    query_states, key_states, value_states = [
-        rearrange(x, "b h s d -> b s h d") for x in [query_states, key_states, value_states]
-    ]
-
-    query_states, key_states, value_states = [x.to(torch.bfloat16) for x in [query_states, key_states, value_states]]
-    # print(f"{query.shape=} {key.shape=} {value.shape=}")
-    # below output will have shape (batch_size, seqlen, nheads, headdim)
-    attn_output = flash_attn_func(query_states, key_states, value_states, causal=True)
-
-    if attn_output.size() != (bsz, q_len, self.num_heads, self.head_dim):
-        raise ValueError(
-            f"`attn_output` should be of size {(bsz, q_len, self.num_heads, self.head_dim)}, but is"
-            f" {attn_output.size()}"
-        )
-
-    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-    attn_output = self.o_proj(attn_output)
-    if output_attentions:
-        raise NotImplementedError("`output_attentions` is not supported when `use_flash_attn` is True")
-    attn_weights = None
-
-    return attn_output, attn_weights, past_key_value
-
-
 # def forward(
 #     self,
 #     hidden_states: torch.Tensor,
 #     attention_mask: Optional[torch.Tensor] = None,
-#     position_ids: Optional[torch.Tensor] = None,
+#     position_ids: Optional[torch.LongTensor] = None,
 #     past_key_value: Optional[Tuple[torch.Tensor]] = None,
 #     output_attentions: bool = False,
 #     use_cache: bool = False,
 # ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-#     """Input shape: Batch x Time x Channel
-
-#     attention_mask: [bsz, q_len]
-#     """
 #     bsz, q_len, _ = hidden_states.size()
 
-#     query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-#     key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-#     value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-#     # [bsz, q_len, nh, hd]
-#     # [bsz, nh, q_len, hd]
+#     if self.config.pretraining_tp > 1:
+#         raise ValueError("pretraining_tp > 1 is not supported for flash attention")
+#     else:
+#         query_states = self.q_proj(hidden_states)
+#         key_states = self.k_proj(hidden_states)
+#         value_states = self.v_proj(hidden_states)
+
+#     query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+#     key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+#     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
 #     kv_seq_len = key_states.shape[-2]
-#     assert past_key_value is None, "past_key_value is not supported"
 
+#     if past_key_value is not None:
+#         kv_seq_len += past_key_value[0].shape[-2]
 #     cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 #     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-#     # [bsz, nh, t, hd]
-#     assert not output_attentions, "output_attentions is not supported"
-#     assert not use_cache, "use_cache is not supported"
 
-#     # Flash attention codes from
-#     # https://github.com/HazyResearch/flash-attention/blob/main/flash_attn/flash_attention.py
+#     if past_key_value is not None:
+#         # reuse k, v, self_attention
+#         key_states = torch.cat([past_key_value[0], key_states], dim=2)
+#         value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
-#     # transform the data into the format required by flash attention
-#     qkv = torch.stack([query_states, key_states, value_states], dim=2)  # [bsz, nh, 3, q_len, hd]
-#     qkv = qkv.transpose(1, 3)  # [bsz, q_len, 3, nh, hd]
-#     # We have disabled _prepare_decoder_attention_mask in LlamaModel
-#     # the attention_mask should be the same as the key_padding_mask
-#     key_padding_mask = attention_mask
+#     past_key_value = (key_states, value_states) if use_cache else None
 
-#     if key_padding_mask is None:
-#         qkv = rearrange(qkv, "b s ... -> (b s) ...")
-#         max_s = q_len
-#         cu_q_lens = torch.arange(0, (bsz + 1) * q_len, step=q_len, dtype=torch.int32, device=qkv.device)
-#         output = flash_attn_unpadded_qkvpacked_func(qkv, cu_q_lens, max_s, 0.0, softmax_scale=None, causal=True)
-#         output = rearrange(output, "(b s) ... -> b s ...", b=bsz)
-#     else:
-#         nheads = qkv.shape[-2]
-#         x = rearrange(qkv, "b s three h d -> b s (three h d)")
-#         x_unpad, indices, cu_q_lens, max_s = unpad_input(x, key_padding_mask)
-#         x_unpad = rearrange(x_unpad, "nnz (three h d) -> nnz three h d", three=3, h=nheads)
-#         output_unpad = flash_attn_unpadded_qkvpacked_func(
-#             x_unpad, cu_q_lens, max_s, 0.0, softmax_scale=None, causal=True
+#     query_states, key_states, value_states = [
+#         rearrange(x, "b h s d -> b s h d") for x in [query_states, key_states, value_states]
+#     ]
+
+#     query_states, key_states, value_states = [x.to(torch.bfloat16) for x in [query_states, key_states, value_states]]
+#     # print(f"{query.shape=} {key.shape=} {value.shape=}")
+#     # below output will have shape (batch_size, seqlen, nheads, headdim)
+#     attn_output = flash_attn_func(query_states, key_states, value_states, causal=True)
+
+#     if attn_output.size() != (bsz, q_len, self.num_heads, self.head_dim):
+#         raise ValueError(
+#             f"`attn_output` should be of size {(bsz, q_len, self.num_heads, self.head_dim)}, but is"
+#             f" {attn_output.size()}"
 #         )
-#         output = rearrange(
-#             pad_input(rearrange(output_unpad, "nnz h d -> nnz (h d)"), indices, bsz, q_len),
-#             "b s (h d) -> b s h d",
-#             h=nheads,
-#         )
-#     return self.o_proj(rearrange(output, "b s h d -> b s (h d)")), None, None
+
+#     attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+#     attn_output = self.o_proj(attn_output)
+#     if output_attentions:
+#         raise NotImplementedError("`output_attentions` is not supported when `use_flash_attn` is True")
+#     attn_weights = None
+
+#     return attn_output, attn_weights, past_key_value
+
+
+def forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.Tensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    """Input shape: Batch x Time x Channel
+
+    attention_mask: [bsz, q_len]
+    """
+    bsz, q_len, _ = hidden_states.size()
+
+    query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    # [bsz, q_len, nh, hd]
+    # [bsz, nh, q_len, hd]
+
+    kv_seq_len = key_states.shape[-2]
+    assert past_key_value is None, "past_key_value is not supported"
+
+    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    # [bsz, nh, t, hd]
+    assert not output_attentions, "output_attentions is not supported"
+    assert not use_cache, "use_cache is not supported"
+
+    # Flash attention codes from
+    # https://github.com/HazyResearch/flash-attention/blob/main/flash_attn/flash_attention.py
+
+    # transform the data into the format required by flash attention
+    qkv = torch.stack([query_states, key_states, value_states], dim=2)  # [bsz, nh, 3, q_len, hd]
+    qkv = qkv.transpose(1, 3)  # [bsz, q_len, 3, nh, hd]
+    # We have disabled _prepare_decoder_attention_mask in LlamaModel
+    # the attention_mask should be the same as the key_padding_mask
+    key_padding_mask = attention_mask
+
+    if key_padding_mask is None:
+        qkv = rearrange(qkv, "b s ... -> (b s) ...")
+        max_s = q_len
+        cu_q_lens = torch.arange(0, (bsz + 1) * q_len, step=q_len, dtype=torch.int32, device=qkv.device)
+        output = flash_attn_unpadded_qkvpacked_func(qkv, cu_q_lens, max_s, 0.0, softmax_scale=None, causal=True)
+        output = rearrange(output, "(b s) ... -> b s ...", b=bsz)
+    else:
+        nheads = qkv.shape[-2]
+        x = rearrange(qkv, "b s three h d -> b s (three h d)")
+        x_unpad, indices, cu_q_lens, max_s = unpad_input(x, key_padding_mask)
+        x_unpad = rearrange(x_unpad, "nnz (three h d) -> nnz three h d", three=3, h=nheads)
+        output_unpad = flash_attn_unpadded_qkvpacked_func(
+            x_unpad, cu_q_lens, max_s, 0.0, softmax_scale=None, causal=True
+        )
+        output = rearrange(
+            pad_input(rearrange(output_unpad, "nnz h d -> nnz (h d)"), indices, bsz, q_len),
+            "b s (h d) -> b s h d",
+            h=nheads,
+        )
+    return self.o_proj(rearrange(output, "b s h d -> b s (h d)")), None, None
 
 
 # Disable the transformation of the attention mask in LlamaModel as the flash attention

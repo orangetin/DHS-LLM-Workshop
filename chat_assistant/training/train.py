@@ -100,7 +100,7 @@ class ScriptArguments:
         metadata={"help": "Enables gradient checkpointing."},
     )
     optim: Optional[str] = field(
-        default="paged_adamw_32bit",
+        default="adamw_hf",
         metadata={"help": "The optimizer to use."},
     )
     lr_scheduler_type: str = field(

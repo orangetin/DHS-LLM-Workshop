@@ -1,7 +1,7 @@
 accelerate launch --config_file "configs/fsdp_config.yaml"  train.py \
---model_name "meta-llama/Llama-2-7b-chat-hf" \
+--model_name "togethercomputer/llama-2-7b-chat" \
 --dataset_name "smangrul/code-chat-assistant-v1" \
---max_seq_len 2048 \
+--max_seq_len 4096 \
 --max_steps 1000 \
 --logging_steps 25 \
 --eval_steps 100 \

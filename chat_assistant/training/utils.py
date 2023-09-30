@@ -126,7 +126,7 @@ def chars_token_ratio(dataset, tokenizer, data_column, nb_examples=400):
 
 
 def create_datasets(tokenizer, args):
-    dataset = load_dataset(args.dataset_name, use_auth_token=True, num_proc=args.num_workers)
+    dataset = load_dataset(args.dataset_name, use_auth_token=True, streaming=True)
     train_data = dataset["train"]
     valid_data = dataset["test"]
     print(f"Size of the train set: {len(train_data)}. Size of the validation set: {len(valid_data)}")
@@ -200,6 +200,7 @@ def create_and_prepare_model(args):
         device_map=device_map,
         use_cache=not args.use_gradient_checkpointing,
         trust_remote_code=True,
+        use_flash_attention_2=True
     )
 
     peft_config = None
