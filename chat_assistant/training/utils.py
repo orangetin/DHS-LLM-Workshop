@@ -15,6 +15,213 @@ from transformers import (
     TrainingArguments,
 )
 
+from datasets import load_dataset
+
+import transformers
+
+from transformers.testing_utils import CaptureLogger
+
+from itertools import chain
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def get_raw_dataset(model_args, data_args):
+    if data_args.dataset_name is not None:
+        # Downloading and loading a dataset from the hub.
+        raw_datasets = load_dataset(
+            data_args.dataset_name,
+            data_args.dataset_config_name,
+            # cache_dir=model_args.cache_dir,
+            use_auth_token=True if model_args.use_auth_token else None,
+            streaming=data_args.streaming,
+        )
+        if "validation" not in raw_datasets.keys():
+            raw_datasets["validation"] = load_dataset(
+                data_args.dataset_name,
+                data_args.dataset_config_name,
+                split=f"train[:{data_args.validation_split_percentage}%]",
+                # cache_dir=model_args.cache_dir,
+                use_auth_token=True if model_args.use_auth_token else None,
+                streaming=data_args.streaming,
+            )
+            raw_datasets["train"] = load_dataset(
+                data_args.dataset_name,
+                data_args.dataset_config_name,
+                split=f"train[{data_args.validation_split_percentage}%:]",
+                # cache_dir=model_args.cache_dir,
+                use_auth_token=True if model_args.use_auth_token else None,
+                streaming=data_args.streaming,
+            )
+    else:
+        data_files = {}
+        dataset_args = {}
+        if data_args.train_files is not None:
+            data_files["train"] = data_args.train_files
+        if data_args.validation_files is not None:
+            data_files["validation"] = data_args.validation_files
+
+        if data_args.train_files is not None:
+            temp_files = data_args.train_files
+        else:
+            temp_files = data_args.validation_files
+
+        extensions = [file.split(".")[-1] for file in temp_files]
+
+        del temp_files
+
+        if not extensions.count(extensions[0]) == len(extensions):
+            raise Exception(
+                "All training/validation data files must be of the same type"
+            )
+
+        extension = extensions[0]
+
+        if extension == "txt":
+            extension = "text"
+            dataset_args["keep_linebreaks"] = data_args.keep_linebreaks
+
+        if extension == "jsonl":
+            extension = "json"
+
+        if extension not in ["text", "csv", "json", "parquet"]:
+            raise Exception(
+                "Invalid training/validation files provided. Only these formats are supported: .txt, .csv, .json, .jsonl"
+            )
+
+        raw_datasets = load_dataset(
+            extension,
+            data_files=data_files,
+            # cache_dir=model_args.cache_dir,
+            use_auth_token=True if model_args.use_auth_token else None,
+            **dataset_args,
+        )
+        # If no validation data is there, validation_split_percentage will be used to divide the dataset.
+        if "validation" not in raw_datasets.keys():
+            raw_datasets["validation"] = load_dataset(
+                extension,
+                data_files=data_files,
+                split=f"train[:{data_args.validation_split_percentage}%]",
+                # cache_dir=model_args.cache_dir,
+                use_auth_token=True if model_args.use_auth_token else None,
+                **dataset_args,
+            )
+            raw_datasets["train"] = load_dataset(
+                extension,
+                data_files=data_files,
+                split=f"train[{data_args.validation_split_percentage}%:]",
+                # cache_dir=model_args.cache_dir,
+                use_auth_token=True if model_args.use_auth_token else None,
+                **dataset_args,
+            )
+
+    return raw_datasets
+
+
+def process_datasets(training_args, data_args, raw_datasets, tokenizer):
+    # Preprocessing the datasets.
+    # First we tokenize all the texts.
+    if training_args.do_train:
+        column_names = list(raw_datasets["train"].features)
+    else:
+        column_names = list(raw_datasets["validation"].features)
+    text_column_name = (
+        data_args.text_column
+        if data_args.text_column in column_names
+        else column_names[0]
+    )
+
+    # since this will be pickled to avoid _LazyModule error in Hasher force logger loading before tokenize_function
+    tok_logger = transformers.utils.logging.get_logger(
+        "transformers.tokenization_utils_base"
+    )
+
+    # fixes major seq-length bug:
+    # https://github.com/huggingface/transformers/issues/16998
+    if tokenizer.model_max_length == 1000000000000000019884624838656:
+        tokenizer.model_max_length = (
+            data_args.block_size if data_args.block_size is not None else 2048
+        )
+
+    def tokenize_function(examples):
+        with CaptureLogger(tok_logger) as cl:
+            output = tokenizer(
+                examples[text_column_name],
+                padding="max_length",
+                truncation=True,
+                max_length=tokenizer.model_max_length,
+            )
+        # clm input could be much much longer than block_size
+        if "Token indices sequence length is longer than the" in cl.out:
+            tok_logger.warning(
+                "^^^^^^^^^^^^^^^^ Please ignore the warning above - this long input will be chunked into smaller bits"
+                " before being passed to the model."
+            )
+        return output
+
+    with training_args.main_process_first(desc="dataset map tokenization"):
+        if not data_args.streaming:
+            tokenized_datasets = raw_datasets.map(
+                tokenize_function,
+                batched=True,
+                num_proc=data_args.preprocessing_num_workers,
+                remove_columns=column_names,
+                load_from_cache_file=not data_args.overwrite_cache,
+                desc="Running tokenizer on dataset",
+            )
+        else:
+            tokenized_datasets = raw_datasets.map(
+                tokenize_function,
+                batched=True,
+                remove_columns=column_names,
+            )
+
+    if data_args.block_size is None:
+        block_size = tokenizer.model_max_length
+    else:
+        if data_args.block_size > tokenizer.model_max_length:
+            logger.warning(
+                f"The block_size passed ({data_args.block_size}) is larger than the maximum length for the model"
+                f"({tokenizer.model_max_length}). Using block_size={tokenizer.model_max_length}."
+            )
+        block_size = min(data_args.block_size, tokenizer.model_max_length)
+
+    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
+    def group_texts(examples):
+        # Concatenate all texts.
+        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
+        # customize this part to your needs.
+        if total_length >= block_size:
+            total_length = (total_length // block_size) * block_size
+        # Split by chunks of max_len.
+        result = {
+            k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
+            for k, t in concatenated_examples.items()
+        }
+        result["labels"] = result["input_ids"].copy()
+        return result
+
+    with training_args.main_process_first(desc="grouping texts together"):
+        if not data_args.streaming:
+            lm_datasets = tokenized_datasets.map(
+                group_texts,
+                batched=True,
+                num_proc=data_args.preprocessing_num_workers,
+                load_from_cache_file=not data_args.overwrite_cache,
+                desc=f"Grouping texts in chunks of {block_size}",
+            )
+        else:
+            lm_datasets = tokenized_datasets.map(
+                group_texts,
+                batched=True,
+            )
+
+    return tokenized_datasets, lm_datasets
+
 
 class SaveDeepSpeedPeftModelCallback(TrainerCallback):
     def __init__(self, trainer, save_steps=500):
